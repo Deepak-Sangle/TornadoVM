@@ -48,7 +48,8 @@ Debugging and Logging
    ``-Dtornado.printKernel=true``                    Prints generated OpenCL/CUDA kernels.
    ``-Dtornado.print.kernel.dir=FILENAME``           Saves generated kernels to the specified file.
    ``-Dtornado.threadInfo=true``                     Displays the number of threads used.
-   ``-Dtornado.print.bytecodes=true``                Prints TornadoVM Internal Bytecodes to stdout.
+   ``-Dtornado.print.bytecodes=MODE``                Prints TornadoVM Internal Bytecodes to stdout. MODE is ``true``/``full`` (every field), ``compact`` (short names, human sizes, per-execution summary), ``trace`` (adds skipped bytecodes and wait-lists) or ``dot`` (Graphviz dependency graph).
+   ``-Dtornado.print.bytecodes.color=POLICY``        Colouring of the bytecode log: ``auto`` (default, only on a terminal), ``always`` or ``never``.
    ``-Dtornado.dump.bytecodes.dir=FILENAME``         Dumps TornadoVM Internal Bytecodes to the specified file.
    ================================================  ============================================================================
 
