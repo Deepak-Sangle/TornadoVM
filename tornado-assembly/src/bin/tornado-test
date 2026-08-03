@@ -22,6 +22,7 @@ import argparse
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -606,6 +607,58 @@ def processStats(out, stats, failedTests, segFaults, unittest):
     return stats, failedTests, segFaults
 
 
+def isProcessCrashed(returncode, err):
+    """ Detects whether a test process was killed by a native crash rather than exiting normally.
+
+    A clean JVM exit is always a small non-negative number on every platform, so three distinct
+    signals indicate a crash:
+
+    - returncode < 0: subprocess observed a killing signal directly (-N for signal N). This is
+      the documented POSIX behaviour, but it only applies when Popen's direct child is the one
+      that gets killed.
+    - 128 < returncode <= 192 on POSIX: on Linux/macOS the direct child of our Popen is actually
+      `bin/tornado`, which `exec`s into `tornado.py`; that script spawns the real JVM via
+      os.system() and, on os.name == 'posix', deliberately re-exposes a killing signal as the
+      classic shell convention 128+signal (see tornado.py's executeCommand). So in practice this
+      is the form we actually observe for a segfault (139) or an abort from a corrupted heap
+      (134), not a bare negative number.
+    - returncode >= 0x80000000 on Windows: there are no signals, so a process killed by an
+      unhandled native exception (access violation, heap corruption, ...) exits with its raw
+      NTSTATUS code. subprocess on Windows surfaces that as-is, i.e. as a large *positive* value
+      with the top two bits set (NTSTATUS severity=Error), e.g. 3221226356 (0xC0000374,
+      STATUS_HEAP_CORRUPTION) - not the negative, sign-reinterpreted form a native shell would
+      display.
+
+    The text check is kept as a fallback for the rare case where a return code doesn't survive
+    the process chain intact.
+    """
+    if returncode is not None:
+        if returncode < 0:
+            return True
+        if returncode >= 0x80000000:
+            return True
+        if os.name == 'posix' and 128 < returncode <= 192:
+            return True
+    return ("Segmentation fault" in err) or ("Aborted" in err)
+
+
+def formatReturnCode(returncode):
+    """ Renders a crash return code, adding the signal name (POSIX) or hex NTSTATUS form
+    (Windows) where one can be determined. """
+    if returncode is None:
+        return "None"
+    if returncode >= 0x80000000:
+        return f"{returncode} (0x{returncode:08X})"
+    if os.name == 'posix':
+        signum = -returncode if returncode < 0 else (returncode - 128 if returncode > 128 else None)
+        if signum:
+            try:
+                return f"{returncode} ({signal.Signals(signum).name})"
+            except ValueError:
+                pass
+    return str(returncode)
+
+
 def runCommandWithStats(command, stats, failedTests, segFaults, monitorClass):
     """ Run a command and update the stats dictionary """
     p = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -618,24 +671,44 @@ def runCommandWithStats(command, stats, failedTests, segFaults, monitorClass):
         monitor_failed_msg = f"[FAILED] Test: class {command.split(' ')[-1]}"
         killAllProcesses(p.pid)
     out, err = p.communicate()
+    returncode = p.returncode
     out = out.decode('utf-8')
     err = err.decode('utf-8')
     if not monitor_status:
         out += monitor_failed_msg
 
-    # Run the test again if the monitor passed but the test seg faulted.
-    # Otherwise, consider this test as not worth to try again.
-    if (err.rfind("Segmentation fault") > 0 and monitor_status):
+    # Run the test again if the monitor passed but the test crashed natively (a segfault on
+    # POSIX, or an unhandled native exception on Windows). Otherwise, consider this test as
+    # not worth to try again.
+    if (isProcessCrashed(returncode, err) and monitor_status):
         print(Colors.REVERSE)
-        print("[!] RUNNING AGAIN BECAUSE OF A SEG FAULT")
+        print(f"[!] RUNNING AGAIN BECAUSE OF A NATIVE CRASH (exit code {formatReturnCode(returncode)})")
         print(Colors.RESET)
         p = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = p.communicate()
+        returncode = p.returncode
         out = out.decode('utf-8')
         err = err.decode('utf-8')
 
     print(err)
     print(out)
+
+    # If the crash survived the retry, the test process never lived long enough to print its
+    # own stats (or any stats it already printed for a whole-class run were lost together with
+    # the process). Record it explicitly instead of letting it disappear from the report.
+    if (isProcessCrashed(returncode, err) and monitor_status):
+        print(Colors.RED)
+        print(f"[!] TEST CRASHED NATIVELY (exit code {formatReturnCode(returncode)}): {unittest}")
+        print(Colors.RESET)
+        segFaults.append(unittest)
+        stats["[FAILED]"] = stats["[FAILED]"] + 1
+        if unittest in __TORNADO_TESTS_WHITE_LIST__:
+            failedTests[unittest] = "YES"
+        else:
+            failedTests[unittest] = "NO"
+            global __TEST_NOT_PASSED__
+            __TEST_NOT_PASSED__ = True
+        return stats, failedTests, segFaults
 
     return processStats(out, stats, failedTests, segFaults, unittest)
 

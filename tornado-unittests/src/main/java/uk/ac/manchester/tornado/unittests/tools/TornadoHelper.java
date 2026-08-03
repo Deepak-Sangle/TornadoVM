@@ -53,14 +53,6 @@ public class TornadoHelper {
         System.out.printf("Test ran: %s, Failed: %s%n", result.getRunCount(), result.getFailureCount());
     }
 
-    private static void printResult(int success, int failed, int notSupported) {
-        System.out.printf("Test ran: %s, Failed: %s, Unsupported: %s%n", (success + failed + notSupported), failed, notSupported);
-    }
-
-    private static void printResult(int success, int failed, int notSupported, StringBuilder buffer) {
-        buffer.append(String.format("Test ran: %s, Failed: %s, Unsupported: %s%n", (success + failed + notSupported), failed, notSupported));
-    }
-
     static boolean getProperty(String property) {
         if (System.getProperty(property) != null) {
             return System.getProperty(property).toLowerCase().equals("true");
@@ -119,150 +111,116 @@ public class TornadoHelper {
             methodsToTest.add(method);
         }
 
-        StringBuilder bufferConsole = new StringBuilder();
-        StringBuilder bufferFile = new StringBuilder();
-
         int successCounter = 0;
         int failedCounter = 0;
         int notSupported = 0;
 
-        bufferConsole.append("Test: " + klass);
-        bufferFile.append("Test: " + klass);
-        if (methodName != null) {
-            bufferConsole.append("#" + methodName);
-            bufferFile.append("#" + methodName);
-        }
-        bufferConsole.append("\n");
-        bufferFile.append("\n");
+        // Every line is written and flushed to the console and the log file as soon as
+        // it is known, instead of being buffered until the whole class finishes. If the
+        // JVM is killed partway through a class (e.g. a native crash in a backend
+        // driver), the results already gathered for that class stay visible instead of
+        // being silently lost with it.
+        try (BufferedWriter fileWriter = new BufferedWriter(new FileWriter("tornado_unittests.log", true))) {
+            DateFormat dateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
+            fileWriter.write("\n" + dateFormat.format(new Date()) + "\n");
+            fileWriter.flush();
 
-        for (Method m : methodsToTest) {
-            String message = String.format("%-50s", "\tRunning test: " + ColorsTerminal.BLUE + m.getName() + ColorsTerminal.RESET);
-            bufferConsole.append(message);
-            bufferFile.append(message);
+            String header = "Test: " + klass + (methodName != null ? "#" + methodName : "") + "\n";
+            emit(fileWriter, header);
 
-            if (suite != null && suite.unsupportedMethods.contains(m)) {
-                message = String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [NOT VALID TEST: UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
-                bufferConsole.append(message);
-                bufferFile.append(message);
-                notSupported++;
-                continue;
-            }
+            for (Method m : methodsToTest) {
+                String runningMessage = String.format("%-50s", "\tRunning test: " + ColorsTerminal.BLUE + m.getName() + ColorsTerminal.RESET);
 
-            Request request = Request.method(klass, m.getName());
-            Result result = new JUnitCore().run(request);
-
-            if (result.wasSuccessful()) {
-                message = String.format("%20s", " ................ " + ColorsTerminal.GREEN + " [PASS] " + ColorsTerminal.RESET + "\n");
-                bufferConsole.append(message);
-                bufferFile.append(message);
-                successCounter++;
-            } else {
-                // If UnsupportedConfigurationException is thrown this means that test did not
-                // fail, it simply can't be run on current configuration
-                if (result.getFailures().stream().filter(e -> (e.getException() instanceof UnsupportedConfigurationException)).count() > 0) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [UNSUPPORTED CONFIGURATION: At least 2 accelerators are required] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
+                if (suite != null && suite.unsupportedMethods.contains(m)) {
+                    String tag = String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [NOT VALID TEST: UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
+                    emit(fileWriter, runningMessage + tag);
                     notSupported++;
                     continue;
                 }
 
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoNoOpenCLPlatformException))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [OPENCL CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
+                Request request = Request.method(klass, m.getName());
+                Result result = new JUnitCore().run(request);
+
+                if (result.wasSuccessful()) {
+                    String tag = String.format("%20s", " ................ " + ColorsTerminal.GREEN + " [PASS] " + ColorsTerminal.RESET + "\n");
+                    emit(fileWriter, runningMessage + tag);
+                    successCounter++;
+                    continue;
+                }
+
+                // If the test did not fail but simply can't run on the current
+                // configuration, one of these exceptions is set on the JUnit result.
+                String unsupportedTag = unsupportedTagFor(result);
+                if (unsupportedTag != null) {
+                    emit(fileWriter, runningMessage + unsupportedTag);
                     notSupported++;
                     continue;
                 }
 
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMMultiDeviceNotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [[UNSUPPORTED] MULTI-DEVICE CONFIGURATION REQUIRED] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMOpenCLNotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [OPENCL CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMMetalNotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [METAL CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMCUDANotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [CUDA CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceFP64NotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [FP64 UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceFP16NotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [FP16 UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceMMANotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [MMA UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceFP8NotSupported))) {
-                    message = String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [FP8 UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
-                    bufferConsole.append(message);
-                    bufferFile.append(message);
-                    notSupported++;
-                    continue;
-                }
-
-                message = String.format("%20s", " ................ " + ColorsTerminal.RED + " [FAILED] " + ColorsTerminal.RESET + "\n");
-                bufferConsole.append(message);
-                bufferFile.append(message);
+                String failedTag = String.format("%20s", " ................ " + ColorsTerminal.RED + " [FAILED] " + ColorsTerminal.RESET + "\n");
+                StringBuilder failureDetails = new StringBuilder(runningMessage).append(failedTag);
                 failedCounter++;
                 for (Failure failure : result.getFailures()) {
-                    bufferConsole.append("\t\t\\_[REASON] " + failure.getMessage() + "\n");
-                    bufferFile.append("\t\t\\_[REASON] " + failure.getMessage() + "\n\t" + failure.getTrace() + "\n" + failure.getDescription() + "\n" + failure.getException());
+                    failureDetails.append("\t\t\\_[REASON] ").append(failure.getMessage()).append("\n\t").append(failure.getTrace()).append("\n").append(failure.getDescription()).append("\n").append(failure.getException());
                 }
+                emit(fileWriter, failureDetails.toString());
             }
-        }
 
-        printResult(successCounter, failedCounter, notSupported, bufferConsole);
-        printResult(successCounter, failedCounter, notSupported, bufferFile);
-        System.out.println(bufferConsole);
-
-        // Print File
-        try (BufferedWriter w = new BufferedWriter(new FileWriter("tornado_unittests.log", true))) {
-            DateFormat dateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
-            Date date = new Date();
-            w.write("\n" + dateFormat.format(date) + "\n");
-            w.write(bufferFile.toString());
+            String summary = String.format("Test ran: %s, Failed: %s, Unsupported: %s%n", (successCounter + failedCounter + notSupported), failedCounter, notSupported);
+            emit(fileWriter, summary);
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+    /**
+     * Writes the given text to both the console and the unit-test log file, flushing both
+     * immediately so the text survives even if the JVM is killed right after this call returns.
+     */
+    private static void emit(BufferedWriter fileWriter, String text) throws IOException {
+        System.out.print(text);
+        System.out.flush();
+        fileWriter.write(text);
+        fileWriter.flush();
+    }
+
+    /**
+     * Returns the console tag for a JUnit failure that is actually an expected
+     * "not supported on this configuration" outcome, or {@code null} if the
+     * failure is a genuine test failure.
+     */
+    private static String unsupportedTagFor(Result result) {
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof UnsupportedConfigurationException))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [UNSUPPORTED CONFIGURATION: At least 2 accelerators are required] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoNoOpenCLPlatformException))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [OPENCL CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMMultiDeviceNotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [[UNSUPPORTED] MULTI-DEVICE CONFIGURATION REQUIRED] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMOpenCLNotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [OPENCL CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMMetalNotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [METAL CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoVMCUDANotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.PURPLE + " [CUDA CONFIGURATION UNSUPPORTED] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceFP64NotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [FP64 UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceFP16NotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [FP16 UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceMMANotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [MMA UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
+        }
+        if (result.getFailures().stream().anyMatch(e -> (e.getException() instanceof TornadoDeviceFP8NotSupported))) {
+            return String.format("%20s", " ................ " + ColorsTerminal.YELLOW + " [FP8 UNSUPPORTED FOR CURRENT DEVICE] " + ColorsTerminal.RESET + "\n");
+        }
+        return null;
     }
 
     static void runTestClassAndMethod(String klassName, String methodName) throws ClassNotFoundException {
