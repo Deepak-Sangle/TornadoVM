@@ -116,6 +116,14 @@ public class TornadoVMInterpreter {
     private HashMap<Object, Integer> totalEvenBatchesPerObject = new HashMap<>();
     private final HashMap<Integer, Long> executionGraphHandles = new HashMap<>();
     private boolean insideCaptureRegion = false;
+
+    /**
+     * When set, the bytecode is walked for its data transfers only: buffers are allocated and
+     * inputs are uploaded, while kernels, copy-outs and deallocations are skipped. It is how
+     * {@code TornadoExecutionPlan.transferToDevice()} gets a plan's inputs onto the device
+     * without running it.
+     */
+    private boolean transfersOnly = false;
     private boolean executionGraphEnabled = true;
 
     private TornadoLogger logger = new TornadoLogger(this.getClass());
@@ -360,6 +368,9 @@ public class TornadoVMInterpreter {
                 if (isWarmup) {
                     continue;
                 }
+                // DEALLOC runs in a transfers-only pass too: it is a no-op for the locked buffers
+                // that hold the uploaded data, and skipping it would let every task-graph of a plan
+                // hold its buffers at once - enough to exhaust the device on a plan of many graphs.
                 if (!executionGraphHandles.isEmpty()) {
                     if (TornadoOptions.LOG_BYTECODES()) {
                         Object object = objects.get(objectIndex);
@@ -396,7 +407,7 @@ public class TornadoVMInterpreter {
                 final long offset = bytecodeResult.getLong();
                 final long sizeBatch = bytecodeResult.getLong();
                 final int[] waitList = (useDependencies) ? waitListFor(eventId) : null;
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 lastEvent = transferDeviceToHost(logBuilder, objectIndex, offset, eventId, sizeBatch, waitList);
@@ -406,7 +417,7 @@ public class TornadoVMInterpreter {
                 final long offset = bytecodeResult.getLong();
                 final long sizeBatch = bytecodeResult.getLong();
                 final int[] waitList = (useDependencies) ? waitListFor(eventId) : null;
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 transferDeviceToHostBlocking(logBuilder, objectIndex, offset, eventId, sizeBatch, waitList);
@@ -417,6 +428,10 @@ public class TornadoVMInterpreter {
                 final int eventId = bytecodeResult.getInt();
                 final long offset = bytecodeResult.getLong();
                 final long batchThreads = bytecodeResult.getLong();
+                if (transfersOnly) {
+                    popArgumentsFromCall(numArgs);
+                    continue;
+                }
                 XPUExecutionFrame executionFrame = compileTaskFromBytecodeToBinary(callWrapperIndex, numArgs, eventId, taskIndex, batchThreads);
                 if (isWarmup) {
                     popArgumentsFromCall(numArgs);
@@ -446,13 +461,13 @@ public class TornadoVMInterpreter {
             } else if (op == TornadoVMBytecodes.BARRIER.value()) {
                 final int eventId = bytecodeResult.getInt();
                 final int[] waitList = (useDependencies && eventId != -1) ? waitListFor(eventId) : null;
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 lastEvent = executeBarrier(logBuilder, eventId, waitList);
             } else if (op == TornadoVMBytecodes.CUDA_GRAPH_LAUNCH.value()) {
                 final int graphId = bytecodeResult.getInt();
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 if (executionGraphHandles.containsKey(graphId)) {
@@ -460,7 +475,7 @@ public class TornadoVMInterpreter {
                 }
             } else if (op == TornadoVMBytecodes.CUDA_GRAPH_BEGIN_CAPTURE.value()) {
                 final int graphId = bytecodeResult.getInt();
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 if (executionGraphHandles.containsKey(graphId)) {
@@ -475,14 +490,14 @@ public class TornadoVMInterpreter {
 
             } else if (op == TornadoVMBytecodes.CUDA_GRAPH_END_CAPTURE.value()) {
                 final int graphId = bytecodeResult.getInt();
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 insideCaptureRegion = false;
                 executeGraphEndCapture(logBuilder, graphId);
             } else if (op == TornadoVMBytecodes.CUDA_GRAPH_DESTROY.value()) {
                 final int graphId = bytecodeResult.getInt();
-                if (isWarmup) {
+                if (isWarmup || transfersOnly) {
                     continue;
                 }
                 Long handle = executionGraphHandles.remove(graphId);
@@ -510,7 +525,11 @@ public class TornadoVMInterpreter {
                 barrier = interpreterDevice.resolveEvent(graphExecutionContext.getExecutionPlanId(), event);
             }
 
-            if (TornadoOptions.USE_VM_FLUSH) {
+            if (transfersOnly) {
+                // The uploads are the whole point of this pass, so wait for them: the caller is
+                // entitled to assume the data is on the device once the call returns.
+                interpreterDevice.sync(graphExecutionContext.getExecutionPlanId());
+            } else if (TornadoOptions.USE_VM_FLUSH) {
                 interpreterDevice.flush(graphExecutionContext.getExecutionPlanId());
             }
         }
@@ -1488,6 +1507,19 @@ public class TornadoVMInterpreter {
 
     public Event execute() {
         return execute(false);
+    }
+
+    /**
+     * Allocates this interpreter's buffers and uploads the task-graph's inputs, without running
+     * any task. The transfers are complete when this returns.
+     */
+    public void transferDataToDevice() {
+        transfersOnly = true;
+        try {
+            execute(false);
+        } finally {
+            transfersOnly = false;
+        }
     }
 
     private String captureIndent() {
